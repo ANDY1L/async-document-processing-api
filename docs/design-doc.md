@@ -1,4 +1,6 @@
-# Care Plan Auto-Generation System — Design Doc
+# Async Document Processing API — Design Doc
+
+**First document type:** Pharmacist care plans
 
 ## 1. Background
 
@@ -6,6 +8,10 @@ The client is a specialty pharmacy (CVS). Pharmacists need to manually write a c
 
 - **Pain Point:** Each care plan takes approximately 20–40 minutes to complete. The pharmacy is severely understaffed and has accumulated a significant backlog of work.
 - **Goal:** After a healthcare worker enters the patient's information, an LLM automatically generates a care plan, significantly reducing the amount of manual time required per patient.
+
+### Why Async
+
+LLM generation takes tens of seconds and can fail because of timeouts, rate limits, or refusals. Holding an HTTP request open for that long gives a poor user experience and risks gateway timeouts. The system is therefore built as an **async document-processing API**: requests are accepted and persisted immediately, and generation happens in a background worker whose progress the client polls. The care plan is the first document type. The pipeline (submit → queue → worker → LLM → quality check → store) is independent of the document type.
 
 ---
 
@@ -31,9 +37,13 @@ Duplicate Detection
     │
     └── WARNING → Require user confirmation
                      ↓
-              Generate Care Plan with LLM
+          Save Order + CarePlan (queued)
                      ↓
-                Display on Page
+        Enqueue Job → Return 202 + Order ID
+                     ↓
+     Worker Generates Care Plan with LLM
+                     ↓
+      Frontend Polls Status → Display on Page
                      ↓
               Download as .txt
                      │
@@ -49,7 +59,7 @@ Duplicate Detection
 1. Web-based form input with validation for every field.
 2. Patient duplicate detection and order duplicate detection.
 3. Provider duplicate detection so that the same provider is only entered once in the system.
-4. LLM-based care plan generation.
+4. Asynchronous LLM-based care plan generation, with status tracking and retry.
 5. Downloading the generated care plan as a text file.
 6. Exporting reports for pharmaceutical companies.
 
@@ -115,7 +125,7 @@ Provider (1) ──< Order >── (1) Patient
 | **Provider** | id, name, npi | `npi` is unique |
 | **Patient** | id, mrn, first_name, last_name, dob | `mrn` is unique |
 | **Order** | id, patient_id, provider_id, medication_name, primary_diagnosis, additional_diagnoses, medication_history, patient_records, created_at | (patient, medication, created_date) is unique, corresponding to R1 |
-| **CarePlan** | id, order_id, content, status, created_at | One-to-one relationship with Order |
+| **CarePlan** | id, order_id, content, status, attempts, error_message, created_at, updated_at | One-to-one relationship with Order. `status` is one of `queued`, `processing`, `completed`, `failed`. |
 
 ### Design Notes
 
@@ -172,15 +182,55 @@ The system should not simply return an unhandled HTTP 500 error.
 
 ---
 
+### Asynchronous Processing
+
+Generation runs in a background worker, never inside the HTTP request.
+
+```
+Request
+   ↓
+Validate + Duplicate Detection
+   ↓
+Create Order + CarePlan (status = queued)   ← same DB transaction
+   ↓
+Enqueue Generation Job (after commit)
+   ↓
+Return 202 + Order ID
+   ↓
+Worker: status = processing → call LLM → quality check
+   ↓
+status = completed (content saved) | failed (error_message saved)
+   ↓
+Frontend polls GET /api/orders/<id>/
+```
+
+State machine:
+
+```
+queued ──> processing ──> completed
+                │
+                └──> failed ──(regenerate)──> queued
+```
+
+Rules:
+
+- The job is enqueued only after the database transaction commits, so a worker never picks up a job whose Order is not yet visible.
+- The worker is idempotent: it only processes a CarePlan in `queued` state and moves it to `processing` atomically, so a duplicated job does not produce two LLM calls.
+- Transient failures (timeouts, rate limits) are retried automatically with exponential backoff up to a bounded number of attempts. Permanent failures (refusal, missing sections after retries) move the CarePlan to `failed`.
+- A CarePlan stuck in `processing` beyond a timeout (e.g. the worker crashed) is treated as failed and can be regenerated.
+- Proposed stack: Celery with Redis as the broker. The choice is revisited in v2 if a simpler DB-backed queue is enough.
+
+---
+
 ## 8. API Design — Draft
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/` | Display the order input form |
-| POST | `/api/orders/` | Validate → duplicate detection → create order → generate Care Plan. Request body may include `confirm: true`. |
-| GET | `/api/orders/<id>/` | Retrieve the Order and its Care Plan |
+| POST | `/api/orders/` | Validate → duplicate detection → create order → enqueue Care Plan generation. Returns `202 Accepted` with the order ID and `status: queued`. Request body may include `confirm: true`. |
+| GET | `/api/orders/<id>/` | Retrieve the Order and its Care Plan status; includes content once `completed` and `error_message` if `failed` |
 | GET | `/api/orders/<id>/careplan.txt` | Download the Care Plan as a text file |
-| POST | `/api/orders/<id>/regenerate/` | Regenerate a Care Plan after a failed generation |
+| POST | `/api/orders/<id>/regenerate/` | Re-enqueue a Care Plan whose generation `failed`. Returns `202`; returns `409` if it is not in `failed` state. |
 | GET | `/api/reports/export.csv?from=&to=` | Export a pharma report for the specified date range |
 
 ### Standard Error and Warning Format
@@ -231,7 +281,8 @@ The exact report requirements still need to be confirmed with the client.
 | Errors are safe, clear, and bounded | Use a standardized error format; never expose stack traces to users; LLM failures must not destroy already-saved data |
 | Code is modular and easy to navigate | Separate responsibilities for validation, duplicate detection, LLM integration, and report export |
 | Critical logic has automated tests | Cover validation rules, duplicate rules R1–R5, and report export; mock the LLM during tests |
-| Runs out of the box | A single `docker compose up` should start the required services, including the web application and database, with sample data available |
+| Runs out of the box | A single `docker compose up` should start the required services, including the web application, worker, queue broker, and database, with sample data available |
+| Long-running work never blocks requests | LLM calls run only in the background worker; the API responds within milliseconds with `202` |
 
 ---
 
@@ -291,33 +342,14 @@ Questions include:
 
 Authentication and auditing are out of scope for the current version, but they should be documented as risks and clarified before production deployment.
 
-### 6. Care Plan Generation Latency
+### 6. Status Updates: Polling vs. Push
 
-LLM generation may take tens of seconds.
+The design uses polling for simplicity. Questions include:
 
-A synchronous HTTP request could therefore create a poor user experience and may time out.
+- Is a polling interval of a few seconds acceptable to users?
+- Is server push (SSE or WebSockets) worth the extra infrastructure later?
 
-A future version should consider asynchronous generation using:
-
-```
-Request
-   ↓
-Create Order
-   ↓
-Enqueue Generation Job
-   ↓
-Return Job / Order ID
-   ↓
-Background Worker
-   ↓
-Call LLM
-   ↓
-Save Care Plan
-   ↓
-Frontend Polls Status
-```
-
-This design decision should be confirmed before implementing the asynchronous architecture.
+The decision to generate asynchronously itself is settled. See Section 7, Asynchronous Processing.
 
 ---
 
@@ -328,10 +360,12 @@ Each iteration adds one major capability on top of the previous version. This al
 | Stage | Implementation | Problem Being Addressed |
 | --- | --- | --- |
 | **v0 — Current MVP** | Django + in-memory dictionary + synchronous LLM call | First make the entire end-to-end workflow work |
-| v1 | Introduce PostgreSQL and implement the data model from Section 6 | In-memory data disappears after restart and cannot be reliably shared across multiple processes |
-| v2 | Add form validation and standardized error responses | Invalid input may currently result in unexpected failures or HTTP 500 responses |
-| v3 | Implement duplicate detection R1–R5 and the WARNING confirmation workflow | Prevent duplicate patients/orders and enforce business rules |
-| v4 | Add Care Plan text download and CSV report export | Complete the required business functionality |
-| v5 | Add automated tests | Provide confidence that future code changes do not break existing behavior |
-| v6 | Introduce asynchronous generation using a queue + worker, with frontend status polling | Prevent LLM generation from blocking HTTP requests for tens of seconds or causing request timeouts |
-| v7 | Add PDF upload and text extraction | Support patient records provided as PDF documents |
+| v1 | Introduce PostgreSQL and implement the data model from Section 6, including CarePlan `status` | In-memory data disappears after restart and cannot be shared between the web process and a worker |
+| v2 | Introduce asynchronous generation using a queue + worker (Celery + Redis), `202` responses, and frontend status polling | LLM generation blocks HTTP requests for tens of seconds and can cause request timeouts |
+| v3 | Add form validation and standardized error responses | Invalid input may currently result in unexpected failures or HTTP 500 responses |
+| v4 | Implement duplicate detection R1–R5 and the WARNING confirmation workflow | Prevent duplicate patients/orders and enforce business rules |
+| v5 | Add reliability: automatic retries with backoff, section quality check, stuck-job recovery, and the regenerate endpoint | LLM calls fail in several ways, and failures must not lose orders |
+| v6 | Add Care Plan text download and CSV report export | Complete the required business functionality |
+| v7 | Add PDF upload and text extraction as a pipeline step in the worker | Support patient records provided as PDF documents |
+
+Automated tests are written alongside each stage rather than as a separate stage, with the LLM mocked.
