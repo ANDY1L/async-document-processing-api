@@ -1,4 +1,5 @@
 import json
+import os
 
 import anthropic
 from django.http import JsonResponse
@@ -8,7 +9,7 @@ from django.shortcuts import render
 CAREPLANS = {}
 NEXT_ID = 1
 
-client = anthropic.Anthropic()  # reads the key from the ANTHROPIC_API_KEY env var
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])  # set in .env, never in code
 
 PROMPT = """You are a clinical pharmacist. Write a pharmacist care plan for the patient below.
 
