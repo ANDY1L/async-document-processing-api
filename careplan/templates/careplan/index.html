@@ -40,7 +40,7 @@
       const data = Object.fromEntries(new FormData(form));
 
       result.hidden = false;
-      result.textContent = "Generating... (waiting for the LLM, this may take tens of seconds)";
+      result.textContent = "Submitting...";
 
       const resp = await fetch("/api/careplans/", {
         method: "POST",
@@ -48,7 +48,9 @@
         body: JSON.stringify(data),
       });
       const json = await resp.json();
-      result.textContent = json.careplan;
+      result.textContent = resp.status === 202
+        ? `Received. Care plan id: ${json.id} (status: ${json.status})`
+        : (json.careplan || JSON.stringify(json));
     });
   </script>
 </body>
