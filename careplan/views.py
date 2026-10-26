@@ -1,8 +1,9 @@
 import json
+import logging
 import os
 import re
 
-import anthropic
+import redis
 from django.db import IntegrityError, transaction
 from django.http import Http404, JsonResponse
 from django.shortcuts import render
@@ -10,28 +11,11 @@ from django.utils import timezone
 
 from careplan.models import CarePlan, Order, Patient, Provider
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])  # set in .env, never in code
+logger = logging.getLogger(__name__)
 
-PROMPT = """You are a clinical pharmacist. Write a pharmacist care plan for the patient below.
+redis_client = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+QUEUE_KEY = "careplan:queue"  # Redis list; a worker will pop ids from here later
 
-Include these sections:
-1. Problem list / Drug therapy problems (DTPs)
-2. Goals (SMART)
-3. Pharmacist interventions / plan
-4. Monitoring plan
-
-Patient: {patient_first_name} {patient_last_name}
-MRN: {patient_mrn}
-DOB: {patient_dob}
-Referring provider: {provider_name} (NPI: {provider_npi})
-Primary diagnosis (ICD-10): {primary_diagnosis}
-Additional diagnoses: {additional_diagnoses}
-Medication: {medication_name}
-Medication history: {medication_history}
-
-Patient records:
-{patient_records}
-"""
 
 
 def index(request):
@@ -68,8 +52,7 @@ def _serialize(careplan):
 def create_careplan(request):
     data = json.loads(request.body)
 
-    # 1) Save the order + a care plan in "processing" state, then commit,
-    #    so the data is in the database before the slow LLM call starts.
+    # 1) Save the order + a care plan (status "queued") and commit.
     try:
         with transaction.atomic():
             provider, _ = Provider.objects.get_or_create(
@@ -93,7 +76,7 @@ def create_careplan(request):
                 patient_records=data["patient_records"],
                 created_date=timezone.localdate(),
             )
-            careplan = CarePlan.objects.create(order=order, status=CarePlan.Status.PROCESSING)
+            careplan = CarePlan.objects.create(order=order, status=CarePlan.Status.QUEUED)
     except IntegrityError:
         # R1: same patient + same medication + same day
         return JsonResponse(
@@ -101,24 +84,17 @@ def create_careplan(request):
             status=409,
         )
 
-    # 2) Synchronous LLM call: this HTTP request blocks here until Claude finishes
-    careplan.attempts += 1
+    # 2) Put the care plan id on the Redis queue (only the id, not the data).
+    #    Done after the transaction committed, so a worker will always find the row.
     try:
-        message = client.messages.create(
-            model="claude-opus-5",
-            max_tokens=16000,
-            messages=[{"role": "user", "content": PROMPT.format(**data)}],
-        )
-        careplan.content = "".join(b.text for b in message.content if b.type == "text")
-        careplan.status = CarePlan.Status.COMPLETED
-    except Exception as e:  # keep the order, record the failure
-        careplan.status = CarePlan.Status.FAILED
-        careplan.error_message = f"Generation failed: {e}"
-    careplan.save()
+        redis_client.rpush(QUEUE_KEY, careplan.id)
+    except redis.RedisError:
+        # The order is safely stored with status "queued"; a later recovery
+        # stage can re-enqueue it. Don't lose the user's request over this.
+        logger.exception("Could not enqueue careplan %s", careplan.id)
 
-    # re-read so fields come back as proper types (e.g. dob as a date)
-    careplan = CarePlan.objects.select_related("order__patient", "order__provider").get(pk=careplan.pk)
-    return JsonResponse(_serialize(careplan), status=200 if careplan.status == "completed" else 502)
+    # 3) Return immediately: "received", not "done".
+    return JsonResponse({"id": careplan.id, "status": careplan.status, "message": "Received"}, status=202)
 
 
 def get_careplan(request, careplan_id):
