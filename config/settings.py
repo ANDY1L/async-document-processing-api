@@ -6,11 +6,23 @@ SECRET_KEY = "dev-only-not-secret"
 DEBUG = True
 ALLOWED_HOSTS = ["*"]
 
-# Only install our own app (so Django can find its templates).
-# No auth / sessions / admin, so no database is needed either.
+import os
+
+# Only our own app (templates + models). No auth / sessions / admin.
 INSTALLED_APPS = ["careplan"]
 MIDDLEWARE = []
-DATABASES = {}
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("POSTGRES_DB", "careplan"),
+        "USER": os.environ.get("POSTGRES_USER", "careplan"),
+        "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "careplan"),
+        "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
+        "PORT": os.environ.get("POSTGRES_PORT", "5433"),
+    }
+}
 
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
